@@ -1136,3 +1136,162 @@ def test_referrers_shorter_path_wins_over_longer_one():
     c3 = next(it for it in data["direct"] if it["id"] == "c3")
     assert c3["chain"] == [3, 1]
 
+
+# --------------------------------------------------------------------------- #
+# 勾选条款摘录 /api/excerpt
+# --------------------------------------------------------------------------- #
+def _excerpt(state, selected):
+    return client.post("/api/excerpt", json={**state, "selected_ids": selected})
+
+
+def test_excerpt_includes_direct_refs_and_renumbers():
+    doc = import_text(GOOD).json()
+    state = _state(doc)
+    # 只勾选 c2：自动纳入其直接引用的 c1；摘录按草稿当前顺序从 1 连续编号
+    r = _excerpt(state, ["c2"])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [it["id"] for it in data["items"]] == ["c1", "c2"]
+    assert [(it["draft_no"], it["excerpt_no"]) for it in data["items"]] == [(1, 1), (2, 2)]
+    assert [it["original"] for it in data["items"]] == [1, 2]
+    # 引用改用摘录内编号，其他正文字符不变
+    assert data["text"].split("\n") == [
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+    ]
+
+
+def test_excerpt_includes_indirect_refs_transitively_in_draft_order():
+    doc = import_text(
+        "\n".join(
+            [
+                "1|独立条款甲",
+                "2|独立条款乙",
+                "3|主条款引用 [[4]]",
+                "4|被引条款引用 [[5]]",
+                "5|末级条款",
+            ]
+        )
+    ).json()
+    state = _state(doc)
+    # 勾选 c3：间接引用链 c3→c4→c5 全部纳入；未引用的 c1、c2 不收录
+    r = _excerpt(state, ["c3"])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [it["id"] for it in data["items"]] == ["c3", "c4", "c5"]
+    assert [(it["draft_no"], it["excerpt_no"]) for it in data["items"]] == [
+        (3, 1),
+        (4, 2),
+        (5, 3),
+    ]
+    assert data["text"].split("\n") == [
+        "1|主条款引用 [[2]]",
+        "2|被引条款引用 [[3]]",
+        "3|末级条款",
+    ]
+
+
+def test_excerpt_self_cycle_and_duplicate_refs_included_once():
+    doc = import_text(
+        "\n".join(
+            [
+                "1|自引 [[1]] 又与 [[2]] 互引",
+                "2|回引 [[1]][[1]]",
+                "3|独立条款",
+            ]
+        )
+    ).json()
+    state = _state(doc)
+    # 自引用、循环与重复引用只收录一次：c1↔c2 各出现一次，c3 不收录
+    r = _excerpt(state, ["c1"])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [it["id"] for it in data["items"]] == ["c1", "c2"]
+    assert data["text"].split("\n") == [
+        "1|自引 [[1]] 又与 [[2]] 互引",
+        "2|回引 [[1]][[1]]",
+    ]
+
+
+def test_excerpt_follows_current_draft_order_not_selection_order():
+    doc = import_text(GOOD).json()
+    # 重排后 c1 在第 2 位、c2 在第 3 位：摘录编号按草稿当前顺序，与勾选传入顺序无关
+    state = _state(doc, ["c4", "c1", "c2", "c3"])
+    r = _excerpt(state, ["c2", "c1"])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [it["id"] for it in data["items"]] == ["c1", "c2"]
+    assert [(it["draft_no"], it["excerpt_no"]) for it in data["items"]] == [(2, 1), (3, 2)]
+    assert data["text"].split("\n") == [
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+    ]
+
+
+def test_excerpt_rejects_broken_ref_inside_scope_with_source_and_target():
+    doc = import_text(GOOD).json()
+    # 删除 c4：c3 中 [[c4]] 失效；勾选 c3 时失效引用在收录范围内 → 整份 409 拒绝
+    state = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [b for b in _bodies(doc) if b["id"] != "c4"],
+    }
+    r = _excerpt(state, ["c3"])
+    assert r.status_code == 409
+    errors = r.json()["detail"]["errors"]
+    assert any("失效引用" in e for e in errors)
+    # 列出来源稳定身份与缺失目标
+    assert any("c3" in e and "c4" in e for e in errors)
+
+
+def test_excerpt_broken_ref_outside_scope_does_not_block_or_lift_export_limit():
+    doc = import_text(GOOD).json()
+    # 删除 c4：失效引用在未勾选的 c3 中（范围外）→ 不阻止摘录
+    state = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [b for b in _bodies(doc) if b["id"] != "c4"],
+    }
+    r = _excerpt(state, ["c2"])
+    assert r.status_code == 200, r.text
+    assert [it["id"] for it in r.json()["items"]] == ["c1", "c2"]
+    # 范围外的失效引用也不解除原整稿下载限制：整稿导出仍 409
+    r = client.post("/api/export", json=state)
+    assert r.status_code == 409
+
+
+def test_excerpt_rejects_empty_duplicate_and_unknown_selection():
+    doc = import_text(GOOD).json()
+    state = _state(doc)
+    # 未选择
+    r = _excerpt(state, [])
+    assert r.status_code == 422
+    # 重复选择
+    r = _excerpt(state, ["c1", "c1"])
+    assert r.status_code == 422
+    # 身份不存在
+    r = _excerpt(state, ["c9"])
+    assert r.status_code == 422
+    # 失败不改草稿：原状态仍可正常预览
+    r = client.post("/api/preview", json=state)
+    assert r.status_code == 200
+    assert len(r.json()["items"]) == 4
+
+
+def test_excerpt_does_not_mutate_draft_and_validates_structure():
+    doc = import_text(GOOD).json()
+    state = _state(doc)
+    import copy
+
+    payload = copy.deepcopy(state)
+    payload["selected_ids"] = ["c3"]
+    r = client.post("/api/excerpt", json=payload)
+    assert r.status_code == 200
+    # 接口只返回摘录，不改正文、顺序或引用绑定
+    assert payload["order_ids"] == state["order_ids"]
+    assert payload["clauses"] == state["clauses"]
+    # 草稿结构非法同样 422
+    r = client.post(
+        "/api/excerpt",
+        json={"order_ids": ["c1"], "clauses": state["clauses"], "selected_ids": ["c1"]},
+    )
+    assert r.status_code == 422
+

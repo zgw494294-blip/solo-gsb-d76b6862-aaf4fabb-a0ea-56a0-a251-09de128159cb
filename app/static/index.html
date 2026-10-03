@@ -40,6 +40,7 @@
         <div class="toolbar-right">
           <button id="merge-btn" disabled>合并所选</button>
           <button id="duplicate-btn" disabled>复制所选</button>
+          <button id="excerpt-btn" disabled>导出摘录</button>
           <button id="diff-btn">对照原稿</button>
           <button id="reimport-btn">重新导入</button>
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
@@ -68,10 +69,26 @@
         <div id="diff-body"></div>
       </section>
 
+      <!-- 勾选条款摘录：把勾选条款及其直接、间接引用的全部现存条款导出为可独立阅读的摘录 -->
+      <section id="excerpt-panel" class="panel excerpt-panel" hidden>
+        <div class="excerpt-head">
+          <h2>勾选条款摘录</h2>
+          <div class="excerpt-status" id="excerpt-status"></div>
+        </div>
+        <p class="hint">
+          按当前已保存草稿生成：自动纳入所选条款直接、间接引用的全部现存条款（自引用、循环与重复引用只收录一次）；
+          摘录按草稿当前顺序从 1 连续编号，正文中的引用改用摘录内编号，其他字符不变。
+          收录范围内有失效引用时整份拒绝；范围外的失效引用不阻止摘录，也不解除整稿下载限制。
+          只读导出：不改变草稿、基线、身份上界或引用绑定；改稿、切换勾选或重新导入会立即清空结果。
+        </p>
+        <div id="excerpt-banner" class="banner excerpt-banner" hidden></div>
+        <div id="excerpt-body"></div>
+      </section>
+
       <div class="columns">
         <div class="panel">
           <h2>条款列表</h2>
-          <p class="hint">用 ↑↓ 或拖拽 ⠿ 调整顺序；勾选两条不同条款后点「合并所选」可按当前显示顺序合并；勾选一条或多条后点「复制所选」可在所选最后一条之后生成整组可独立编辑的副本；点「拆分」可在选定分界处把一条已保存正文拆成前后两条（原指向本条的引用可选落前段或后段）；编号为当前显示编号，引用始终指向导入时绑定的条款。</p>
+          <p class="hint">用 ↑↓ 或拖拽 ⠿ 调整顺序；勾选两条不同条款后点「合并所选」可按当前显示顺序合并；勾选一条或多条后点「复制所选」可在所选最后一条之后生成整组可独立编辑的副本，点「导出摘录」可把勾选条款及其引用的全部现存条款导出为可独立阅读的摘录；点「拆分」可在选定分界处把一条已保存正文拆成前后两条（原指向本条的引用可选落前段或后段）；编号为当前显示编号，引用始终指向导入时绑定的条款。</p>
           <ol id="clause-list" class="clause-list"></ol>
         </div>
 
