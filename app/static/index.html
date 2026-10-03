@@ -40,6 +40,7 @@
         <div class="toolbar-right">
           <button id="merge-btn" disabled>合并所选</button>
           <button id="duplicate-btn" disabled>复制所选</button>
+          <button id="excerpt-btn" disabled>导出摘录</button>
           <button id="diff-btn">对照原稿</button>
           <button id="reimport-btn">重新导入</button>
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
@@ -66,6 +67,22 @@
         </p>
         <div id="diff-banner" class="banner diff-banner" hidden></div>
         <div id="diff-body"></div>
+      </section>
+
+      <!-- 勾选条款摘录：勾选条款及其直接、间接引用条款的独立编号摘录（只读，不改草稿） -->
+      <section id="excerpt-panel" class="panel excerpt-panel" hidden>
+        <div class="excerpt-head">
+          <h2>勾选条款摘录</h2>
+          <div class="excerpt-status" id="excerpt-status"></div>
+        </div>
+        <p class="hint">
+          收录勾选条款及其<b>直接、间接引用的全部现存条款</b>（自引用、循环与重复引用只收录一次）；
+          摘录按草稿当前顺序从 1 连续编号，正文中的引用已改用摘录内编号，其余字符不变。
+          收录范围内存在失效引用时整份拒绝；范围外的失效引用不影响摘录，也不解除整稿「下载纯文本」的限制。
+          摘录为只读操作，不改变草稿、原稿基线、身份上界与引用绑定；改稿、切换勾选或重新导入会立即清空结果。
+        </p>
+        <div id="excerpt-banner" class="banner excerpt-banner" hidden></div>
+        <div id="excerpt-body"></div>
       </section>
 
       <div class="columns">

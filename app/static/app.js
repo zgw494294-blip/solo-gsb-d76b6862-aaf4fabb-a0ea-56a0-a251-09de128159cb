@@ -36,6 +36,9 @@ const state = {
   refsData: null, // 最近一次与当前草稿一致的 /api/referrers 响应；改稿 / 换目标 / 重新导入立即置空
   refsError: null, // 最近一次引用查询失败的错误信息（数组）；成功一次或收起后清空
   refsFresh: false, // 引用结果是否已追上当前草稿；改稿立即为 false
+  excerptData: null, // 最近一次与当前草稿+勾选一致的 /api/excerpt 响应；改稿 / 切换勾选 / 重新导入立即置空
+  excerptError: null, // 最近一次摘录导出失败的错误信息（数组）；成功一次或清空后复位
+  excerpting: false, // /api/excerpt 在途（期间忽略重复提交）
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -47,6 +50,7 @@ let diffSeq = 0; // 对照请求序号：只采用最后一次发出的对照响
 let diffInFlight = false; // 是否已有 /api/diff 在途：防止重复提交
 let refsSeq = 0; // 「谁引用本条」请求序号：只采用最后一次发出的响应，迟到响应不得恢复旧结果
 let refsInFlight = false; // 是否已有 /api/referrers 在途：防止重复提交
+let excerptSeq = 0; // 摘录请求序号：改稿 / 切换勾选 / 重新导入 / 新请求都会推进，迟到响应一律丢弃
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -69,6 +73,11 @@ const diffPanel = $("#diff-panel");
 const diffStatus = $("#diff-status");
 const diffBanner = $("#diff-banner");
 const diffBody = $("#diff-body");
+const excerptBtn = $("#excerpt-btn");
+const excerptPanel = $("#excerpt-panel");
+const excerptStatus = $("#excerpt-status");
+const excerptBanner = $("#excerpt-banner");
+const excerptBody = $("#excerpt-body");
 const statCount = $("#stat-count");
 const statBroken = $("#stat-broken");
 
@@ -154,6 +163,8 @@ function touch() {
   state.refsFresh = false;
   state.refsData = null;
   state.refsError = null;
+  // 勾选条款摘录同理：改稿立即清空旧结果与提示，在途请求的迟到响应一律丢弃
+  clearExcerpt();
   syncToolbar();
   syncDiffPanel();
   syncReferrers();
@@ -164,6 +175,7 @@ function touch() {
 function syncToolbar() {
   updateMergeBtn();
   updateDuplicateBtn();
+  updateExcerptBtn();
   updateDownloadBtn();
   syncBusy();
 }
@@ -277,6 +289,30 @@ function updateDownloadBtn() {
   downloadBtn.textContent = state.exporting ? "下载中…" : "下载纯文本";
 }
 
+// 导出摘录按钮：未保存编辑或拆分选择未结束时不可用；与合并/复制同样要求预览已追上
+// 当前草稿。摘录只针对收录范围内的失效引用整份拒绝，范围外的失效引用不阻止摘录，
+// 因此不像「下载纯文本」那样因 has_broken 禁用。
+function updateExcerptBtn() {
+  if (state.excerpting) {
+    excerptBtn.disabled = true;
+    excerptBtn.textContent = "导出中…";
+    return;
+  }
+  excerptBtn.disabled =
+    state.editingId !== null ||
+    state.splittingId !== null ||
+    state.merging ||
+    state.splitting ||
+    state.duplicating ||
+    !state.previewFresh ||
+    state.pickIds.length < 1;
+  excerptBtn.textContent = "导出摘录";
+  excerptBtn.title =
+    state.pickIds.length < 1
+      ? "勾选一条或多条条款后可导出摘录"
+      : "把勾选条款及其直接、间接引用的全部现存条款导出为独立编号的摘录";
+}
+
 // --------------------------------------------------------------------------- //
 // 导入
 // --------------------------------------------------------------------------- //
@@ -383,6 +419,8 @@ $("#reimport-btn").addEventListener("click", () => {
   state.refsFresh = false;
   refsSeq += 1;
   refsInFlight = false;
+  // 重新导入立即清空旧摘录结果：在途请求的迟到响应不得恢复结果、提示或触发下载
+  clearExcerpt();
   state.preview = null;
   state.previewError = null;
   state.renderedRev = null;
@@ -842,8 +880,10 @@ clauseList.addEventListener("change", (ev) => {
     state.pickIds = state.pickIds.filter((x) => x !== id);
   }
   document.getElementById(`card-${id}`).classList.toggle("selected", pick.checked);
+  clearExcerpt(); // 切换勾选立即清空旧摘录结果，在途响应回来也不再采用
   updateMergeBtn();
   updateDuplicateBtn();
+  updateExcerptBtn();
 });
 
 // --------------------------------------------------------------------------- //
@@ -1591,6 +1631,129 @@ clauseList.addEventListener("click", (ev) => {
     // 重试前同样清空旧错误内容，避免旧提示残留
     state.refsError = null;
     refreshReferrers();
+  }
+});
+
+// --------------------------------------------------------------------------- //
+// 勾选条款摘录（只读：不改正文、顺序、基线、身份上界或引用绑定）
+// --------------------------------------------------------------------------- //
+// 摘录结果只对应“某一修订号 + 某一组勾选”：改稿、切换勾选或重新导入时立即清空
+// （旧结果不置灰保留），并推进请求序号——在途请求的迟到响应既不能恢复结果与提示，
+// 也不会触发下载。
+function clearExcerpt() {
+  state.excerptData = null;
+  state.excerptError = null;
+  state.excerpting = false;
+  excerptSeq += 1;
+  syncExcerptPanel();
+}
+
+// 编号映射表：摘录编号 ↔ 草稿编号（当前显示编号）↔ 稳定身份
+function excerptMapHtml(items) {
+  const rows = items
+    .map(
+      (it) =>
+        `<tr><td class="excerpt-no">${it.excerpt_no}</td>` +
+        `<td>第 ${it.draft_no} 条</td>` +
+        `<td><span class="diff-id">${esc(it.id)}</span>（原第 ${it.original} 条）</td></tr>`,
+    )
+    .join("");
+  return (
+    `<table class="excerpt-map"><thead><tr>` +
+    `<th>摘录编号</th><th>草稿编号</th><th>稳定身份</th>` +
+    `</tr></thead><tbody>${rows}</tbody></table>`
+  );
+}
+
+function syncExcerptPanel() {
+  const active = state.excerpting || state.excerptError !== null || state.excerptData !== null;
+  excerptPanel.hidden = !active;
+  if (!active) {
+    excerptBody.innerHTML = "";
+    excerptBanner.hidden = true;
+    excerptBanner.textContent = "";
+    excerptStatus.textContent = "";
+    return;
+  }
+  if (state.excerptError) {
+    excerptStatus.textContent = "摘录导出被拒绝";
+    excerptBanner.hidden = false;
+    excerptBanner.innerHTML =
+      `<strong>摘录导出失败，整份未生成。</strong>草稿、基线与引用绑定均未改动：` +
+      `<ul>${state.excerptError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`;
+  } else {
+    excerptBanner.hidden = true;
+    excerptBanner.textContent = "";
+    excerptStatus.textContent = state.excerpting
+      ? "摘录导出中…"
+      : `共收录 ${state.excerptData.items.length} 条（含直接、间接引用的条款），摘录内编号从 1 连续排列`;
+  }
+  const data = state.excerptData;
+  excerptBody.innerHTML = data
+    ? excerptMapHtml(data.items) +
+      `<pre class="preview excerpt-text">${esc(data.text)}</pre>` +
+      `<div class="excerpt-actions">` +
+      `<button type="button" class="primary" data-action="excerpt-download">下载摘录</button>` +
+      `<button type="button" data-action="excerpt-close">收起</button>` +
+      `</div>`
+    : "";
+}
+
+// 按当前已保存草稿与当前勾选请求 /api/excerpt；只采用仍持有收尾权的响应——
+// 改稿、切换勾选或重新导入都会推进序号，迟到响应不得恢复结果、提示或触发下载。
+excerptBtn.addEventListener("click", async () => {
+  if (state.excerpting) return; // 忽略等待期间的重复提交
+  if (state.editingId || state.splittingId) return; // 未保存编辑 / 拆分选择须先结束（按钮已禁用，这里兜底）
+  const picks = state.pickIds.slice();
+  if (!picks.length || !state.previewFresh) return;
+  const token = ++excerptSeq;
+  const epoch = state.epoch;
+  const rev = state.rev;
+  state.excerpting = true;
+  state.excerptData = null;
+  state.excerptError = null;
+  syncToolbar();
+  syncExcerptPanel();
+  try {
+    const data = await api("/api/excerpt", { ...snapshot(), selected_ids: picks });
+    if (token !== excerptSeq || epoch !== state.epoch || rev !== state.rev) return; // 迟到响应：丢弃
+    state.excerpting = false;
+    if (!data || typeof data.text !== "string" || !Array.isArray(data.items)) {
+      state.excerptError = ["摘录响应正文不完整，请重试。"];
+    } else {
+      state.excerptData = data;
+    }
+    syncToolbar();
+    syncExcerptPanel();
+  } catch (e) {
+    if (token !== excerptSeq || epoch !== state.epoch || rev !== state.rev) return; // 旧请求的失败不在新状态上提示
+    state.excerpting = false;
+    state.excerptError = errorList(e);
+    syncToolbar();
+    syncExcerptPanel();
+  }
+});
+
+// 摘录面板内：下载本次结果的文本、收起面板
+excerptPanel.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-action]");
+  if (!btn) return;
+  if (btn.dataset.action === "excerpt-close") {
+    clearExcerpt();
+    updateExcerptBtn();
+  } else if (btn.dataset.action === "excerpt-download") {
+    // 下载的是页面上正展示的最近一次成功结果；改稿 / 切换勾选 / 重新导入已清空结果，
+    // 迟到响应不会恢复旧结果，因此保存的文件一定与当前展示一致
+    const data = state.excerptData;
+    if (!data) return;
+    const blob = new Blob([data.text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+    a.href = url;
+    a.download = `excerpt-${stamp}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 });
 

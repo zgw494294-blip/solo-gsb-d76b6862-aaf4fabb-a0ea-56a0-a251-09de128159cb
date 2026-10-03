@@ -39,6 +39,16 @@
   到目标的最短引用链：长度 1 的边来源为直接引用者，距离 ≥2 的为间接引用者，目标
   本身不列入；重复引用与循环不会造成重复或死循环。
 - 等长链按整条链的当前编号序列取字典序最小；结果按来源的当前顺序排列。
+
+勾选条款摘录（``POST /api/excerpt``）：
+- 入参沿用现有草稿结构（``order_ids`` / ``clauses``）加所选稳定身份（``selected_ids``）；
+  未选择、重复选择或身份不存在均 422 拒绝；接口只读，不改草稿、基线、身份上界或引用绑定。
+- 收录范围为所选条款及其直接、间接引用（沿"目标仍在草稿内"的有效引用可达）的全部现存
+  条款；自引用、循环与重复引用只收录一次。摘录按草稿当前顺序从 1 连续编号，正文中的
+  引用改用摘录内编号，其余正文字符不变。
+- 收录范围内存在失效引用（目标已不在草稿）时整份拒绝（409），列出来源稳定身份与缺失
+  目标；范围外的失效引用不阻止摘录，也不影响整稿导出的既有规则。
+- 返回摘录文本及各条的稳定身份、草稿编号（当前显示编号）与摘录编号。
 """
 
 from __future__ import annotations
@@ -122,6 +132,10 @@ class DuplicateIn(BaseModel):
 
 class ReferrersIn(StateIn):
     target_id: str  # 被查询的条款稳定身份；不存在则拒绝（422）
+
+
+class ExcerptIn(StateIn):
+    selected_ids: list[str]  # 要收入摘录的条款身份；自动并入其直接、间接引用的全部现存条款
 
 
 # --------------------------------------------------------------------------- #
@@ -803,6 +817,104 @@ def referrers(payload: ReferrersIn):
         "direct": direct,
         "indirect": indirect,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 勾选条款摘录
+# --------------------------------------------------------------------------- #
+@app.post("/api/excerpt")
+def excerpt_doc(payload: ExcerptIn):
+    """把所选条款及其直接、间接引用的全部现存条款导出为独立编号的摘录。
+
+    - 收录范围：``selected_ids`` 及沿有效引用（目标仍在草稿内）可达的全部条款；
+      自引用、循环与重复引用只收录一次。只读接口，不改草稿、基线、身份上界或引用绑定。
+    - 摘录按草稿当前顺序从 1 连续编号；正文中的引用改用摘录内编号，其余字符不变。
+    - 收录范围内存在失效引用（目标已不在草稿）时整份拒绝（409），列出来源稳定身份
+      与缺失目标；范围外的失效引用不阻止摘录，也不影响整稿导出的既有规则。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    errors: list[str] = []
+    if not payload.selected_ids:
+        errors.append("未选择要导出摘录的条款")
+    seen: set[str] = set()
+    for sel in payload.selected_ids:
+        if sel in seen:
+            errors.append(f"所选条款重复：{sel}")
+        seen.add(sel)
+    for sel in payload.selected_ids:
+        if sel not in by_id:
+            errors.append(f"所选条款不存在：{sel}")
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+    # 收录闭包：沿有效引用遍历（失效引用的目标不在草稿内，无法跟随，随后单独检查）；
+    # included 集合保证自引用、循环与重复引用只收录一次
+    included: set[str] = set()
+    queue: deque[str] = deque(payload.selected_ids)
+    while queue:
+        clause_id = queue.popleft()
+        if clause_id in included:
+            continue
+        included.add(clause_id)
+        for m in MARKER_RE.finditer(by_id[clause_id].body):
+            target = m.group(1)
+            if target in by_id and target not in included:
+                queue.append(target)
+
+    pos_by_id = {clause_id: i + 1 for i, clause_id in enumerate(payload.order_ids)}
+
+    # 收录范围内的失效引用：整份拒绝，列出来源稳定身份与缺失目标
+    broken: list[dict] = []
+    for clause_id in payload.order_ids:
+        if clause_id not in included:
+            continue
+        for m in MARKER_RE.finditer(by_id[clause_id].body):
+            target = m.group(1)
+            if target not in by_id:
+                broken.append(
+                    {
+                        "source_id": clause_id,
+                        "source_no": pos_by_id[clause_id],
+                        "ref_id": target,
+                        "ref_original": int(ID_RE.match(target).group(1)),  # 形态已由 _validate_state 保证
+                    }
+                )
+    if broken:
+        sources = [
+            f"来源 {b['source_id']}（草稿第 {b['source_no']} 条）含失效引用 "
+            f"[[原{b['ref_original']}?]]，缺失目标 {b['ref_id']}"
+            for b in broken
+        ]
+        raise HTTPException(
+            409,
+            detail={
+                "errors": ["摘录范围内存在失效引用，整份摘录拒绝导出，请先修复：", *sources],
+                "broken": broken,
+            },
+        )
+
+    # 按草稿当前顺序从 1 连续编号；引用改用摘录内编号，其余正文字符不变
+    ordered = [clause_id for clause_id in payload.order_ids if clause_id in included]
+    excerpt_no = {clause_id: i + 1 for i, clause_id in enumerate(ordered)}
+
+    def renumber(m: re.Match) -> str:
+        # 收录条款的每个引用：有效引用目标必在闭包内，失效引用已在上面整份拒绝
+        return f"[[{excerpt_no[m.group(1)]}]]"
+
+    items: list[dict] = []
+    lines: list[str] = []
+    for clause_id in ordered:
+        no = excerpt_no[clause_id]
+        lines.append(f"{no}|{MARKER_RE.sub(renumber, by_id[clause_id].body)}")
+        items.append(
+            {
+                "id": clause_id,
+                "original": int(clause_id[1:]),
+                "draft_no": pos_by_id[clause_id],
+                "excerpt_no": no,
+            }
+        )
+    return {"text": "\n".join(lines), "items": items}
 
 
 # --------------------------------------------------------------------------- #
